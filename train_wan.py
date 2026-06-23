@@ -137,7 +137,9 @@ def precompute(
             continue
 
         first_pil   = clip[0]
-        first_pixel = pipe.video_processor.preprocess(first_pil, height=h, width=w).to(device, torch.float32)
+        # image_processor (VaeImageProcessor) → [1, 3, H, W] in [-1, 1]
+        # video_processor returns 5D with T=0 for a single PIL, which breaks prepare_latents
+        first_pixel = pipe.image_processor.preprocess(first_pil, height=h, width=w).to(device, torch.float32)
         _, condition = pipe.prepare_latents(
             image=first_pixel, batch_size=1,
             num_channels_latents=pipe.vae.config.z_dim,
