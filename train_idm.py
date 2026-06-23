@@ -287,6 +287,7 @@ def main():
     cameras   = discover_cameras(probe)
     action_dim = discover_action_dim(probe)
     fps        = probe.fps
+    output_dir = Path(args.output)
 
     print(f"  Cameras:    {cameras}")
     print(f"  Action dim: {action_dim}")
