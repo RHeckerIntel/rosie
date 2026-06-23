@@ -106,9 +106,22 @@ def main():
     parser.add_argument("--save-every",    type=int,   default=10)
     parser.add_argument("--resume",        action="store_true",
                         help="Resume from <output>/resume.pt if it exists")
+    parser.add_argument("--export",        action="store_true",
+                        help="Export idm.safetensors from resume.pt and exit (no training)")
     parser.add_argument("--seed",          type=int,   default=42)
     parser.add_argument("--list-cameras",  action="store_true", help="Print cameras and exit")
     args = parser.parse_args()
+
+    # ── Export-only mode ──
+    if args.export:
+        output_dir  = Path(args.output)
+        resume_path = output_dir / "resume.pt"
+        if not resume_path.exists():
+            raise FileNotFoundError(f"No resume.pt found in {output_dir}")
+        ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        save_file(ckpt["model"], str(output_dir / "idm.safetensors"))
+        print(f"Exported epoch {ckpt['epoch']} → {output_dir / 'idm.safetensors'}")
+        return
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -159,6 +172,18 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
     print(f"  {len(dataset)} training samples, {len(loader)} batches/epoch")
+
+    # ── Write config early so extract_actions.py can run against resume.pt ──
+    config = dict(
+        action_dim=action_dim,
+        action_horizon=H,
+        camera=camera,
+        fps=fps,
+        inference_steps=args.inference_steps,
+        action_mean=action_mean.tolist() if action_mean is not None else None,
+        action_std=action_std.tolist()   if action_std  is not None else None,
+    )
+    (output_dir / "config.json").write_text(json.dumps(config, indent=2))
 
     # ── Build model ──
     print(f"\nBuilding IDM...")
