@@ -118,7 +118,12 @@ def precompute(
 
     prompt_file = cache_dir / "prompt_embeds.pt"
     if not prompt_file.exists():
-        prompt_embeds, _ = pipe.encode_prompt(prompt, torch.device("cpu"), 1, False)
+        prompt_embeds, _ = pipe.encode_prompt(
+            prompt,
+            device=torch.device("cpu"),
+            num_videos_per_prompt=1,
+            do_classifier_free_guidance=False,
+        )
         torch.save(prompt_embeds.cpu(), prompt_file)
     prompt_embeds = torch.load(prompt_file, weights_only=True)
 
@@ -137,9 +142,7 @@ def precompute(
             continue
 
         first_pil   = clip[0]
-        # image_processor (VaeImageProcessor) → [1, 3, H, W] in [-1, 1]
-        # video_processor returns 5D with T=0 for a single PIL, which breaks prepare_latents
-        first_pixel = pipe.image_processor.preprocess(first_pil, height=h, width=w).to(device, torch.float32)
+        first_pixel = pipe.video_processor.preprocess(first_pil, height=h, width=w).to(device, torch.float32)
         _, condition = pipe.prepare_latents(
             image=first_pixel, batch_size=1,
             num_channels_latents=pipe.vae.config.z_dim,
