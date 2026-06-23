@@ -169,7 +169,8 @@ def precompute(
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def training_step(transformer, batch: dict, prompt_embeds: torch.Tensor, device: torch.device) -> torch.Tensor:
-    dtype = next(p for p in transformer.parameters()).dtype
+    # LoRA params are float32; get dtype from frozen base weights instead
+    dtype = next(p for p in transformer.parameters() if not p.requires_grad).dtype
     clean  = batch["clean_latents"].to(device, dtype)
     cond   = batch["condition"].to(device, dtype)
     t_emb  = prompt_embeds.to(device, dtype)
