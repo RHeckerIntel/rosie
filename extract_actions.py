@@ -88,68 +88,92 @@ def write_lerobot_dataset(
     task: str,
 ) -> None:
     """
-    Writes a minimal LeRobot v2-compatible dataset:
+    Writes a LeRobot v3.0-compatible dataset:
         meta/info.json
-        meta/episodes.jsonl
-        meta/tasks.jsonl
+        meta/tasks.parquet
+        meta/episodes/chunk-000/file-000.parquet
         meta/stats.json
-        data/chunk-000/episode_000000.parquet
-        videos/chunk-000/{camera}/episode_000000.mp4
+        data/chunk-000/file-000.parquet
+        videos/{camera}/chunk-000/file-000.mp4
     """
+    import pandas as pd
+
     n_frames, action_dim = actions.shape
     h, w = frames[0].shape[:2]
 
     # ── Directory structure ──
-    data_dir  = output_dir / "data"  / "chunk-000"
-    video_dir = output_dir / "videos" / "chunk-000" / camera
-    meta_dir  = output_dir / "meta"
-    for d in [data_dir, video_dir, meta_dir]:
+    data_dir      = output_dir / "data" / "chunk-000"
+    video_dir     = output_dir / "videos" / camera / "chunk-000"
+    meta_dir      = output_dir / "meta"
+    episodes_dir  = meta_dir / "episodes" / "chunk-000"
+    for d in [data_dir, video_dir, meta_dir, episodes_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     # ── Video ──
     print("  Writing video...")
-    video_path = video_dir / "episode_000000.mp4"
-    writer = imageio.get_writer(str(video_path), fps=fps, codec="libx264", quality=8)
+    writer = imageio.get_writer(str(video_dir / "file-000.mp4"), fps=fps, codec="libx264", quality=8)
     for f in frames:
         writer.append_data(f)
     writer.close()
 
-    # ── Parquet ──
+    # ── Data parquet ──
     print("  Writing parquet...")
     action_list = pa.array(
         [row.tolist() for row in actions],
         type=pa.list_(pa.float32(), action_dim),
     )
     table = pa.table({
-        "frame_index":              pa.array(range(n_frames), type=pa.int64()),
-        "episode_index":            pa.array([0] * n_frames,  type=pa.int64()),
-        "timestamp":                pa.array([i / fps for i in range(n_frames)], type=pa.float32()),
-        "action":                   action_list,
-        "index":                    pa.array(range(n_frames), type=pa.int64()),
-        "episode_data_index_from":  pa.array([0] * n_frames,  type=pa.int64()),
-        "episode_data_index_to":    pa.array([n_frames] * n_frames, type=pa.int64()),
-        "next.done":                pa.array([False] * (n_frames - 1) + [True], type=pa.bool_()),
+        "frame_index":   pa.array(range(n_frames),           type=pa.int64()),
+        "episode_index": pa.array([0] * n_frames,            type=pa.int64()),
+        "timestamp":     pa.array([i / fps for i in range(n_frames)], type=pa.float32()),
+        "action":        action_list,
+        "task_index":    pa.array([0] * n_frames,            type=pa.int64()),
+        "index":         pa.array(range(n_frames),           type=pa.int64()),
     })
-    pq.write_table(table, str(data_dir / "episode_000000.parquet"))
+    pq.write_table(table, str(data_dir / "file-000.parquet"))
 
-    # ── Meta files ──
+    # ── tasks.parquet ──
+    tasks_df = pd.DataFrame({"task_index": [0]}, index=pd.Index([task], name="task"))
+    tasks_df.to_parquet(meta_dir / "tasks.parquet")
+
+    # ── episodes/chunk-000/file-000.parquet ──
+    episodes_table = pa.table({
+        "episode_index":               pa.array([0],         type=pa.int64()),
+        "tasks":                       pa.array([[task]]),
+        "length":                      pa.array([n_frames],  type=pa.int64()),
+        "dataset_from_index":          pa.array([0],         type=pa.int64()),
+        "dataset_to_index":            pa.array([n_frames],  type=pa.int64()),
+        "data/chunk_index":            pa.array([0],         type=pa.int64()),
+        "data/file_index":             pa.array([0],         type=pa.int64()),
+        f"videos/{camera}/chunk_index":      pa.array([0],             type=pa.int64()),
+        f"videos/{camera}/file_index":       pa.array([0],             type=pa.int64()),
+        f"videos/{camera}/from_timestamp":   pa.array([0.0],           type=pa.float32()),
+        f"videos/{camera}/to_timestamp":     pa.array([n_frames / fps], type=pa.float32()),
+        "meta/episodes/chunk_index":   pa.array([0],         type=pa.int64()),
+        "meta/episodes/file_index":    pa.array([0],         type=pa.int64()),
+    })
+    pq.write_table(episodes_table, str(episodes_dir / "file-000.parquet"))
+
+    # ── info.json ──
     info = {
-        "codebase_version": "v2.0",
-        "robot_type": "unknown",
+        "codebase_version": "v3.0",
+        "robot_type": None,
         "total_episodes": 1,
         "total_frames": n_frames,
         "total_tasks": 1,
-        "total_videos": 1,
-        "total_chunks": 1,
         "chunks_size": 1000,
+        "data_files_size_in_mb": 100,
+        "video_files_size_in_mb": 200,
         "fps": fps,
-        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "splits": {"train": "0:1"},
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {
             camera: {
                 "dtype": "video",
                 "shape": [3, h, w],
                 "names": ["channel", "height", "width"],
+                "video": True,
                 "info": {
                     "video.fps": fps,
                     "video.codec": "libx264",
@@ -163,23 +187,16 @@ def write_lerobot_dataset(
                 "shape": [action_dim],
                 "names": None,
             },
-            "timestamp":           {"dtype": "float32", "shape": [1], "names": None},
-            "frame_index":         {"dtype": "int64",   "shape": [1], "names": None},
-            "episode_index":       {"dtype": "int64",   "shape": [1], "names": None},
-            "index":               {"dtype": "int64",   "shape": [1], "names": None},
-            "next.done":           {"dtype": "bool",    "shape": [1], "names": None},
+            "timestamp":      {"dtype": "float32", "shape": [1], "names": None},
+            "frame_index":    {"dtype": "int64",   "shape": [1], "names": None},
+            "episode_index":  {"dtype": "int64",   "shape": [1], "names": None},
+            "index":          {"dtype": "int64",   "shape": [1], "names": None},
+            "task_index":     {"dtype": "int64",   "shape": [1], "names": None},
         },
     }
     (meta_dir / "info.json").write_text(json.dumps(info, indent=2))
 
-    (meta_dir / "episodes.jsonl").write_text(
-        json.dumps({"episode_index": 0, "tasks": [task], "length": n_frames}) + "\n"
-    )
-    (meta_dir / "tasks.jsonl").write_text(
-        json.dumps({"task_index": 0, "task": task}) + "\n"
-    )
-
-    # Action stats
+    # ── stats.json ──
     mean = actions.mean(axis=0).tolist()
     std  = actions.std(axis=0).clip(1e-6).tolist()
     mn   = actions.min(axis=0).tolist()
