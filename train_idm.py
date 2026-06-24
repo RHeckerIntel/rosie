@@ -46,11 +46,10 @@ def load_dataset(dataset_arg: str):
     return _lerobot_dataset(repo_id=dataset_arg)
 
 
-def load_dataset_with_windows(dataset_arg: str, camera: str, H: int, fps: float):
-    delta = {
-        camera:   [0.0, H / fps],
-        "action": [i / fps for i in range(H)],
-    }
+def load_dataset_with_windows(dataset_arg: str, cameras: list[str], H: int, fps: float):
+    delta = {"action": [i / fps for i in range(H)]}
+    for cam in cameras:
+        delta[cam] = [0.0, H / fps]
     local = Path(dataset_arg)
     if local.exists():
         return _lerobot_dataset(**_local_kwargs(local), delta_timestamps=delta)
@@ -93,7 +92,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch: int, output_dir: Path) -
 def main():
     parser = argparse.ArgumentParser(description="Train IDM on a LeRobot dataset")
     parser.add_argument("--dataset",       required=True, help="Local path or HuggingFace repo id")
-    parser.add_argument("--camera",        default=None,  help="Camera key (auto-detects first found)")
+    parser.add_argument("--cameras",       default=None, nargs="+",
+                        help="Camera keys to train on (auto-detects all found if omitted)")
     parser.add_argument("--output",        default="./idm")
     parser.add_argument("--epochs",        type=int,   default=50)
     parser.add_argument("--lr",            type=float, default=1e-4)
@@ -144,10 +144,11 @@ def main():
     if args.list_cameras:
         return
 
-    camera = args.camera or cameras[0]
-    if camera not in cameras:
-        raise ValueError(f"Camera '{camera}' not found. Available: {cameras}")
-    print(f"  Using cam:  {camera}")
+    cameras = args.cameras or cameras
+    missing = [c for c in cameras if c not in discover_cameras(probe)]
+    if missing:
+        raise ValueError(f"Cameras not found: {missing}. Available: {discover_cameras(probe)}")
+    print(f"  Using cams: {cameras}")
 
     action_mean, action_std = load_action_stats(probe)
     if action_mean is not None:
@@ -161,7 +162,7 @@ def main():
     # ── Dataset with temporal windows ──
     H = args.action_horizon
     print(f"\nLoading dataset with H={H} action horizon at {fps} fps...")
-    dataset = load_dataset_with_windows(args.dataset, camera, H, fps)
+    dataset = load_dataset_with_windows(args.dataset, cameras, H, fps)
     loader  = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -177,7 +178,7 @@ def main():
     config = dict(
         action_dim=action_dim,
         action_horizon=H,
-        camera=camera,
+        cameras=cameras,
         fps=fps,
         inference_steps=args.inference_steps,
         action_mean=action_mean.tolist() if action_mean is not None else None,
@@ -186,8 +187,8 @@ def main():
     (output_dir / "config.json").write_text(json.dumps(config, indent=2))
 
     # ── Build model ──
-    print(f"\nBuilding IDM...")
-    model = IDM(action_dim=action_dim, action_horizon=H).to(device)
+    print(f"\nBuilding IDM (num_cameras={len(cameras)})...")
+    model = IDM(action_dim=action_dim, action_horizon=H, num_cameras=len(cameras)).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
@@ -229,17 +230,17 @@ def main():
             epoch_loss = 0.0
 
             for batch in loader:
-                # batch[camera]: [B, 2, C, H, W] — two timestamps
+                # batch[cam]: [B, 2, C, H, W] — two timestamps per camera
                 # batch["action"]: [B, H, action_dim]
-                frame_t  = batch[camera][:, 0].to(device)
-                frame_tH = batch[camera][:, 1].to(device)
-                actions  = batch["action"].to(device, dtype=torch.float32)
+                frames_t  = [batch[cam][:, 0].to(device) for cam in cameras]
+                frames_tH = [batch[cam][:, 1].to(device) for cam in cameras]
+                actions   = batch["action"].to(device, dtype=torch.float32)
 
                 if action_mean is not None:
                     actions = (actions - action_mean) / action_std
 
                 optimizer.zero_grad()
-                loss = model(frame_t, frame_tH, actions)
+                loss = model(frames_t, frames_tH, actions)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0
@@ -276,7 +277,7 @@ def main():
     config = dict(
         action_dim=action_dim,
         action_horizon=H,
-        camera=camera,
+        cameras=cameras,
         fps=fps,
         inference_steps=args.inference_steps,
         action_mean=action_mean.tolist() if action_mean is not None else None,

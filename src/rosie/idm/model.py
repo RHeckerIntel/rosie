@@ -77,6 +77,7 @@ class IDM(nn.Module):
         self,
         action_dim: int,
         action_horizon: int = 16,
+        num_cameras: int = 1,
         hidden: int = SIGLIP_DIM,
         backbone_layers: int = 4,
         dit_layers: int = 8,
@@ -86,6 +87,7 @@ class IDM(nn.Module):
         super().__init__()
         self.action_dim     = action_dim
         self.action_horizon = action_horizon
+        self.num_cameras    = num_cameras
 
         self.siglip   = AutoModel.from_pretrained(SIGLIP_MODEL, torch_dtype=torch.bfloat16)
         self.siglip.requires_grad_(False)
@@ -103,21 +105,51 @@ class IDM(nn.Module):
             frame = TF.resize(frame, [SIGLIP_SIZE, SIGLIP_SIZE], antialias=True)
         return (frame * 2.0 - 1.0).to(dtype=self.siglip.dtype)
 
-    def encode_frames(self, frame_t: torch.Tensor, frame_tH: torch.Tensor) -> torch.Tensor:
-        """Returns fused visual context [B, 2*(N+1), hidden] in float32."""
+    def _encode_one(self, frame: torch.Tensor) -> torch.Tensor:
         dev = next(self.siglip.parameters()).device
+        return self.siglip.vision_model(
+            pixel_values=self._preprocess(frame).to(dev)
+        ).last_hidden_state
+
+    def encode_frames(
+        self,
+        frames_t:  list[torch.Tensor],
+        frames_tH: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Returns fused visual context [B, 2*num_cams*tokens, hidden] in float32.
+
+        frames_t / frames_tH: one [B, C, H, W] tensor per camera.
+        If fewer cameras are given than num_cameras, the last one is repeated.
+        """
+        # Pad to num_cameras by repeating the last tensor
+        def _pad(lst):
+            while len(lst) < self.num_cameras:
+                lst = lst + [lst[-1]]
+            return lst[:self.num_cameras]
+
+        frames_t  = _pad(list(frames_t))
+        frames_tH = _pad(list(frames_tH))
+
+        tokens = []
         with torch.no_grad():
-            ft  = self.siglip.vision_model(pixel_values=self._preprocess(frame_t).to(dev)).last_hidden_state
-            ftH = self.siglip.vision_model(pixel_values=self._preprocess(frame_tH).to(dev)).last_hidden_state
-        ctx = torch.cat([ft, ftH], dim=1).float()
+            for ft, ftH in zip(frames_t, frames_tH):
+                tokens.append(self._encode_one(ft))
+                tokens.append(self._encode_one(ftH))
+
+        ctx = torch.cat(tokens, dim=1).float()
         for block in self.backbone:
             ctx = block(ctx)
         return ctx
 
-    def forward(self, frame_t: torch.Tensor, frame_tH: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        frames_t:  list[torch.Tensor],
+        frames_tH: list[torch.Tensor],
+        actions:   torch.Tensor,
+    ) -> torch.Tensor:
         """Flow matching training loss (MSE on velocity field)."""
         B, device = actions.shape[0], actions.device
-        ctx    = self.encode_frames(frame_t, frame_tH)
+        ctx    = self.encode_frames(frames_t, frames_tH)
         noise  = torch.randn_like(actions)
         t      = torch.rand(B, device=device)
         noisy  = (1 - t[:, None, None]) * actions + t[:, None, None] * noise
@@ -129,10 +161,16 @@ class IDM(nn.Module):
         return F.mse_loss(self.action_out(x), target)
 
     @torch.no_grad()
-    def get_actions(self, frame_t: torch.Tensor, frame_tH: torch.Tensor, steps: int = 16) -> torch.Tensor:
+    def get_actions(
+        self,
+        frames_t:  list[torch.Tensor],
+        frames_tH: list[torch.Tensor],
+        steps: int = 16,
+    ) -> torch.Tensor:
         """Euler ODE integration from noise to actions. Returns [B, H, action_dim]."""
-        B, device = frame_t.shape[0], frame_t.device
-        ctx = self.encode_frames(frame_t, frame_tH)
+        B      = frames_t[0].shape[0]
+        device = frames_t[0].device
+        ctx = self.encode_frames(frames_t, frames_tH)
         z   = torch.randn(B, self.action_horizon, self.action_dim, device=device)
         dt  = 1.0 / steps
         for i in range(steps, 0, -1):

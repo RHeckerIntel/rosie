@@ -45,29 +45,30 @@ def frames_to_tensor(frames: list[np.ndarray], device: torch.device) -> torch.Te
 
 def run_inference(
     model: IDM,
-    frame_tensors: torch.Tensor,   # [N, C, H, W]
+    frame_tensors: list[torch.Tensor],   # one [N, C, H, W] tensor per camera
     H: int,
     batch_size: int,
     steps: int,
 ) -> np.ndarray:
     """
-    Slide IDM over (frame_t, frame_{t+H}) pairs.
+    Slide IDM over (frame_t, frame_{t+H}) pairs across all cameras.
     Returns actions [N-H, action_dim] — one action per labeled frame.
     """
-    N = frame_tensors.shape[0]
+    N         = frame_tensors[0].shape[0]
     n_labeled = N - H
     action_dim = model.action_dim
     all_actions = np.zeros((n_labeled, action_dim), dtype=np.float32)
 
     for start in range(0, n_labeled, batch_size):
         end = min(start + batch_size, n_labeled)
-        idx = list(range(start, end))
+        idx  = list(range(start, end))
+        idxH = [i + H for i in idx]
 
-        ft  = frame_tensors[idx]          # [B, C, H, W]
-        ftH = frame_tensors[[i + H for i in idx]]
+        ft_list  = [ft[idx]  for ft in frame_tensors]
+        ftH_list = [ft[idxH] for ft in frame_tensors]
 
         # get_actions returns [B, H, action_dim] — take step 0 as the label for frame t
-        preds = model.get_actions(ft, ftH, steps=steps)  # [B, H, action_dim]
+        preds = model.get_actions(ft_list, ftH_list, steps=steps)
         all_actions[start:end] = preds[:, 0, :].cpu().float().numpy()
 
         print(f"  Frames {end}/{n_labeled}", end="\r")
@@ -216,8 +217,10 @@ def write_lerobot_dataset(
 def main():
     parser = argparse.ArgumentParser(description="Extract pseudo-actions from a video using a trained IDM")
     parser.add_argument("--idm",        required=True, help="Path to IDM output dir (contains idm.safetensors + config.json)")
-    parser.add_argument("--video",      required=True, help="Input video (.mp4)")
-    parser.add_argument("--output",     default=None,  help="Output LeRobot dataset dir (default: <video_stem>_dataset)")
+    parser.add_argument("--videos",     required=True, nargs="+",
+                        help="Input video(s) (.mp4) — one per camera in training order. "
+                             "If fewer are given than the model's num_cameras, the last one is repeated.")
+    parser.add_argument("--output",     default=None,  help="Output LeRobot dataset dir (default: <first_video_stem>_dataset)")
     parser.add_argument("--task",       default="robot manipulation task",
                                         help="Task description stored in the dataset")
     parser.add_argument("--repo-id",    default=None,  help="LeRobot repo_id for the output dataset")
@@ -225,11 +228,11 @@ def main():
     parser.add_argument("--cpu",        action="store_true", help="Force CPU (default: CUDA)")
     args = parser.parse_args()
 
-    device = torch.device("cpu" if args.cpu else "cuda")
-    video_path = Path(args.video)
-    idm_dir    = Path(args.idm)
+    device    = torch.device("cpu" if args.cpu else "cuda")
+    idm_dir   = Path(args.idm)
+    video_paths = [Path(v) for v in args.videos]
 
-    output_dir = Path(args.output) if args.output else video_path.parent / f"{video_path.stem}_dataset"
+    output_dir = Path(args.output) if args.output else video_paths[0].parent / f"{video_paths[0].stem}_dataset"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     repo_id = args.repo_id or output_dir.name
@@ -243,20 +246,21 @@ def main():
     action_dim  = config["action_dim"]
     H           = config["action_horizon"]
     fps         = config["fps"]
-    camera      = config["camera"]
+    # Support old single-camera configs
+    cameras     = config.get("cameras") or [config["camera"]]
     steps       = config["inference_steps"]
     action_mean = np.array(config["action_mean"], dtype=np.float32) if config.get("action_mean") else None
     action_std  = np.array(config["action_std"],  dtype=np.float32) if config.get("action_std")  else None
 
-    print(f"IDM config: action_dim={action_dim}, H={H}, fps={fps}, camera={camera}")
+    num_cameras = len(cameras)
+    print(f"IDM config: action_dim={action_dim}, H={H}, fps={fps}, cameras={cameras}")
 
     # ── Build and load IDM ──
     print("Loading IDM weights...")
-    model = IDM(action_dim=action_dim, action_horizon=H).to(device)
+    model = IDM(action_dim=action_dim, action_horizon=H, num_cameras=num_cameras).to(device)
 
     weights_path = idm_dir / "idm.safetensors"
     if not weights_path.exists():
-        # Try latest checkpoint
         ckpts = sorted(idm_dir.glob("checkpoint_epoch*.safetensors"))
         if not ckpts:
             raise FileNotFoundError(f"No IDM weights found in {idm_dir}")
@@ -270,20 +274,30 @@ def main():
     model.eval()
     print(f"  Loaded: {weights_path.name}")
 
-    # ── Load video ──
-    print(f"Loading video: {video_path}")
-    raw_frames = load_video_frames(video_path)
-    print(f"  {len(raw_frames)} frames at {fps} fps")
+    # ── Load videos (pad to num_cameras by repeating last) ──
+    while len(video_paths) < num_cameras:
+        video_paths.append(video_paths[-1])
+        print(f"  Repeating {video_paths[-1].name} for camera {len(video_paths)}/{num_cameras}")
+    video_paths = video_paths[:num_cameras]
 
-    if len(raw_frames) <= H:
-        raise ValueError(f"Video has only {len(raw_frames)} frames but H={H} — need at least {H+1} frames")
+    all_raw_frames: list[list] = []
+    for i, vp in enumerate(video_paths):
+        print(f"Loading video [{i+1}/{num_cameras}]: {vp}")
+        frames = load_video_frames(vp)
+        print(f"  {len(frames)} frames")
+        if len(frames) <= H:
+            raise ValueError(f"Video {vp} has only {len(frames)} frames but H={H}")
+        all_raw_frames.append(frames)
+
+    # Trim all videos to the same length
+    min_len = min(len(f) for f in all_raw_frames)
+    all_raw_frames = [f[:min_len] for f in all_raw_frames]
 
     # ── Run inference ──
     print(f"Running IDM inference (H={H}, batch={args.batch_size}, steps={steps})...")
-    frame_tensors = frames_to_tensor(raw_frames, device)
-    actions_norm = run_inference(model, frame_tensors, H, args.batch_size, steps)
+    all_tensors = [frames_to_tensor(frames, device) for frames in all_raw_frames]
+    actions_norm = run_inference(model, all_tensors, H, args.batch_size, steps)
 
-    # Unnormalize
     if action_mean is not None and action_std is not None:
         actions = actions_norm * action_std + action_mean
     else:
@@ -292,14 +306,14 @@ def main():
     print(f"  Predicted {len(actions)} actions  |  shape={actions.shape}")
     print(f"  Action range: [{actions.min():.3f}, {actions.max():.3f}]")
 
-    # Save raw numpy alongside the dataset for easy inspection
     np.save(str(output_dir / "actions.npy"), actions)
     print(f"  Raw actions saved: {output_dir / 'actions.npy'}")
 
-    # ── Write LeRobot dataset ──
+    # ── Write LeRobot dataset (uses primary / first camera video) ──
     print("Writing LeRobot dataset...")
-    labeled_frames = raw_frames[:len(actions)]  # drop last H frames (no future frame to condition on)
-    write_lerobot_dataset(output_dir, repo_id, camera, labeled_frames, actions, fps, args.task)
+    primary_camera = cameras[0]
+    labeled_frames = all_raw_frames[0][:len(actions)]
+    write_lerobot_dataset(output_dir, repo_id, primary_camera, labeled_frames, actions, fps, args.task)
 
 
 if __name__ == "__main__":
