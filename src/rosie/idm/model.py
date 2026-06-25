@@ -111,17 +111,16 @@ class IDM(nn.Module):
             pixel_values=self._preprocess(frame).to(dev)
         ).last_hidden_state
 
-    def encode_frames(
+    def siglip_encode(
         self,
         frames_t:  list[torch.Tensor],
         frames_tH: list[torch.Tensor],
     ) -> torch.Tensor:
-        """Returns fused visual context [B, 2*num_cams*tokens, hidden] in float32.
+        """Run SigLIP only. Returns raw tokens [B, 2*num_cams*seq, hidden].
 
-        frames_t / frames_tH: one [B, C, H, W] tensor per camera.
-        If fewer cameras are given than num_cameras, the last one is repeated.
+        This is the expensive frozen step — cache its output to skip it every epoch.
+        Token order: [cam0_t, cam0_tH, cam1_t, cam1_tH, ...]
         """
-        # Pad to num_cameras by repeating the last tensor
         def _pad(lst):
             while len(lst) < self.num_cameras:
                 lst = lst + [lst[-1]]
@@ -135,21 +134,28 @@ class IDM(nn.Module):
             for ft, ftH in zip(frames_t, frames_tH):
                 tokens.append(self._encode_one(ft))
                 tokens.append(self._encode_one(ftH))
+        return torch.cat(tokens, dim=1)
 
-        ctx = torch.cat(tokens, dim=1).float()
+    def _backbone_forward(self, raw: torch.Tensor) -> torch.Tensor:
+        ctx = raw.float()
         for block in self.backbone:
             ctx = block(ctx)
         return ctx
 
-    def forward(
+    def encode_frames(
         self,
         frames_t:  list[torch.Tensor],
         frames_tH: list[torch.Tensor],
-        actions:   torch.Tensor,
     ) -> torch.Tensor:
-        """Flow matching training loss (MSE on velocity field)."""
+        """SigLIP → backbone. Returns fused context [B, seq, hidden]."""
+        return self._backbone_forward(self.siglip_encode(frames_t, frames_tH))
+
+    def encode_from_cache(self, cached_tokens: torch.Tensor) -> torch.Tensor:
+        """Backbone only — skips SigLIP. Pass output of siglip_encode."""
+        return self._backbone_forward(cached_tokens)
+
+    def _dit_forward(self, ctx: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         B, device = actions.shape[0], actions.device
-        ctx    = self.encode_frames(frames_t, frames_tH)
         noise  = torch.randn_like(actions)
         t      = torch.rand(B, device=device)
         noisy  = (1 - t[:, None, None]) * actions + t[:, None, None] * noise
@@ -159,6 +165,20 @@ class IDM(nn.Module):
         for block in self.dit:
             x = block(x, ctx, t_emb)
         return F.mse_loss(self.action_out(x), target)
+
+    def forward(
+        self,
+        frames_t:  list[torch.Tensor],
+        frames_tH: list[torch.Tensor],
+        actions:   torch.Tensor,
+        *,
+        cached_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Flow matching training loss (MSE on velocity field)."""
+        ctx = (self.encode_from_cache(cached_tokens)
+               if cached_tokens is not None
+               else self.encode_frames(frames_t, frames_tH))
+        return self._dit_forward(ctx, actions)
 
     @torch.no_grad()
     def get_actions(

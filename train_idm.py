@@ -75,6 +75,52 @@ def load_action_stats(dataset) -> tuple[torch.Tensor | None, torch.Tensor | None
         return None, None
 
 
+# ── Feature caching ───────────────────────────────────────────────────────────
+
+def precompute_features(model, loader, cameras: list[str], device, cache_path: str) -> torch.Tensor:
+    """Run SigLIP over every dataset item once and save the concatenated tokens.
+
+    Returns a tensor of shape [max_index+1, 2*num_cameras*seq, hidden] stored in
+    bfloat16. During training, index by batch['index'] to get pre-encoded tokens.
+    """
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        print(f"Loading feature cache: {cache_path}")
+        return torch.load(cache_path, map_location="cpu", weights_only=True)
+
+    print("Pre-computing SigLIP features (runs once per dataset) ...")
+    model.eval()
+
+    # Probe token count and find max index from first batch
+    probe_batch = next(iter(loader))
+    with torch.no_grad():
+        probe_t = [probe_batch[cam][:1, 0].to(device) for cam in cameras]
+        probe_tH = [probe_batch[cam][:1, 1].to(device) for cam in cameras]
+        probe_out = model.siglip_encode(probe_t, probe_tH)   # [1, total_tokens, hidden]
+    _, n_tokens, hidden = probe_out.shape
+
+    max_idx = -1
+    for batch in loader:
+        max_idx = max(max_idx, int(batch["index"].max()))
+
+    cache = torch.zeros(max_idx + 1, n_tokens, hidden, dtype=torch.bfloat16)
+
+    for batch in loader:
+        indices  = batch["index"]
+        frames_t  = [batch[cam][:, 0].to(device) for cam in cameras]
+        frames_tH = [batch[cam][:, 1].to(device) for cam in cameras]
+        with torch.no_grad():
+            tokens = model.siglip_encode(frames_t, frames_tH).cpu().bfloat16()
+        for b, idx in enumerate(indices):
+            cache[int(idx)] = tokens[b]
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(cache, cache_path)
+    print(f"  Feature cache saved: {cache_path}  ({cache.nbytes / 1e9:.2f} GB)")
+    model.train()
+    return cache
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def save_checkpoint(model, optimizer, scheduler, epoch: int, output_dir: Path) -> None:
@@ -104,6 +150,11 @@ def main():
     parser.add_argument("--action-horizon",type=int,   default=16, help="H: actions predicted per frame pair")
     parser.add_argument("--inference-steps",type=int,  default=16, help="ODE steps at inference time")
     parser.add_argument("--save-every",    type=int,   default=10)
+    parser.add_argument("--cache-features", default=None, metavar="PATH",
+                        help="Pre-compute SigLIP features to PATH (.pt). Huge speedup: "
+                             "SigLIP runs once instead of every step.")
+    parser.add_argument("--compile",       action="store_true",
+                        help="torch.compile backbone + DiT (~20-40%% faster on H100/A100)")
     parser.add_argument("--resume",        action="store_true",
                         help="Resume from <output>/resume.pt if it exists")
     parser.add_argument("--export",        action="store_true",
@@ -194,6 +245,15 @@ def main():
     total     = sum(p.numel() for p in model.parameters())
     print(f"  Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
+    if args.compile:
+        print("  torch.compile: backbone + DiT (first epoch will be slow) ...")
+        model.backbone = torch.nn.ModuleList([
+            torch.compile(b, mode="reduce-overhead") for b in model.backbone
+        ])
+        model.dit = torch.nn.ModuleList([
+            torch.compile(d, mode="reduce-overhead") for d in model.dit
+        ])
+
     # ── Optimizer (8-bit AdamW, SigLIP frozen so no waste on its params) ──
     import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit(
@@ -203,6 +263,13 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs * len(loader)
     )
+
+    # ── Feature cache (build once, skip SigLIP every step) ──
+    feature_cache = None
+    if args.cache_features:
+        feature_cache = precompute_features(model, loader, cameras, device, args.cache_features)
+        feature_cache = feature_cache.to(device)
+        print(f"  Cache on GPU: {feature_cache.shape}  ({feature_cache.nbytes / 1e9:.2f} GB)")
 
     # ── Resume ──
     start_epoch = 1
@@ -232,15 +299,23 @@ def main():
             for batch in loader:
                 # batch[cam]: [B, 2, C, H, W] — two timestamps per camera
                 # batch["action"]: [B, H, action_dim]
-                frames_t  = [batch[cam][:, 0].to(device) for cam in cameras]
-                frames_tH = [batch[cam][:, 1].to(device) for cam in cameras]
-                actions   = batch["action"].to(device, dtype=torch.float32)
+                actions = batch["action"].to(device, dtype=torch.float32)
 
                 if action_mean is not None:
                     actions = (actions - action_mean) / action_std
 
+                if feature_cache is not None:
+                    cached = feature_cache[batch["index"]].float()
+                    kwargs = dict(cached_tokens=cached)
+                    frames_t = frames_tH = []
+                else:
+                    frames_t  = [batch[cam][:, 0].to(device) for cam in cameras]
+                    frames_tH = [batch[cam][:, 1].to(device) for cam in cameras]
+                    kwargs = {}
+
                 optimizer.zero_grad()
-                loss = model(frames_t, frames_tH, actions)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss = model(frames_t, frames_tH, actions, **kwargs)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0
