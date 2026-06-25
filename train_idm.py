@@ -17,6 +17,7 @@ import json
 import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
 
@@ -77,48 +78,78 @@ def load_action_stats(dataset) -> tuple[torch.Tensor | None, torch.Tensor | None
 
 # ── Feature caching ───────────────────────────────────────────────────────────
 
-def precompute_features(model, loader, cameras: list[str], device, cache_path: str) -> torch.Tensor:
-    """Run SigLIP over every dataset item once and save the concatenated tokens.
+def precompute_features(
+    model, loader, cameras: list[str], device, cache_dir: str
+) -> tuple[torch.Tensor, "np.ndarray"]:
+    """Run SigLIP once per dataset item and cache to disk as a memory-mapped file.
 
-    Returns a tensor of shape [max_index+1, 2*num_cameras*seq, hidden] stored in
-    bfloat16. During training, index by batch['index'] to get pre-encoded tokens.
+    Uses compact sequential slots so allocation = N_unique_items × token_size,
+    not max_global_index × token_size (which can be huge on large datasets).
+
+    Returns (index_map, mmap) where:
+      index_map[abs_idx]  → slot  (int32 tensor, lives in CPU RAM, tiny)
+      mmap[slot]          → [n_tokens, hidden] float16 features (on disk, demand-paged)
     """
-    cache_path = Path(cache_path)
-    if cache_path.exists():
-        print(f"Loading feature cache: {cache_path}")
-        return torch.load(cache_path, map_location="cpu", weights_only=True)
+    cache_dir  = Path(cache_dir)
+    map_path   = cache_dir / "index_map.pt"
+    feat_path  = cache_dir / "features.npy"
+    shape_path = cache_dir / "shape.pt"
+
+    if map_path.exists() and feat_path.exists():
+        print(f"Loading feature cache from {cache_dir} ...")
+        index_map  = torch.load(map_path, map_location="cpu", weights_only=True)
+        shape      = torch.load(shape_path, weights_only=True)
+        mmap       = np.memmap(feat_path, dtype="float16", mode="r", shape=tuple(shape))
+        print(f"  {shape[0]:,} slots  {np.prod(shape) * 2 / 1e9:.2f} GB on disk")
+        return index_map, mmap
 
     print("Pre-computing SigLIP features (runs once per dataset) ...")
     model.eval()
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Probe token count and find max index from first batch
-    probe_batch = next(iter(loader))
+    # ── Probe token dimensions ──
+    probe = next(iter(loader))
     with torch.no_grad():
-        probe_t = [probe_batch[cam][:1, 0].to(device) for cam in cameras]
-        probe_tH = [probe_batch[cam][:1, 1].to(device) for cam in cameras]
-        probe_out = model.siglip_encode(probe_t, probe_tH)   # [1, total_tokens, hidden]
+        probe_out = model.siglip_encode(
+            [probe[cam][:1, 0].to(device) for cam in cameras],
+            [probe[cam][:1, 1].to(device) for cam in cameras],
+        )
     _, n_tokens, hidden = probe_out.shape
 
-    max_idx = -1
+    # ── Collect all unique absolute indices ──
+    all_abs = set()
     for batch in loader:
-        max_idx = max(max_idx, int(batch["index"].max()))
+        all_abs.update(batch["index"].tolist())
+    all_abs = sorted(all_abs)
+    N = len(all_abs)
 
-    cache = torch.zeros(max_idx + 1, n_tokens, hidden, dtype=torch.bfloat16)
+    # ── Build compact index_map: abs_index → slot (0..N-1) ──
+    max_abs   = all_abs[-1]
+    index_map = torch.full((max_abs + 1,), -1, dtype=torch.int32)
+    for slot, abs_idx in enumerate(all_abs):
+        index_map[abs_idx] = slot
 
+    # ── Allocate memmap on disk ──
+    shape = (N, n_tokens, hidden)
+    mmap  = np.memmap(feat_path, dtype="float16", mode="w+", shape=shape)
+    print(f"  {N:,} items  |  {np.prod(shape) * 2 / 1e9:.2f} GB → {feat_path}")
+
+    # ── Fill ──
     for batch in loader:
-        indices  = batch["index"]
+        abs_indices = batch["index"].tolist()
         frames_t  = [batch[cam][:, 0].to(device) for cam in cameras]
         frames_tH = [batch[cam][:, 1].to(device) for cam in cameras]
         with torch.no_grad():
-            tokens = model.siglip_encode(frames_t, frames_tH).cpu().bfloat16()
-        for b, idx in enumerate(indices):
-            cache[int(idx)] = tokens[b]
+            tokens = model.siglip_encode(frames_t, frames_tH).cpu().to(torch.float16).numpy()
+        for b, abs_idx in enumerate(abs_indices):
+            mmap[int(index_map[abs_idx])] = tokens[b]
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(cache, cache_path)
-    print(f"  Feature cache saved: {cache_path}  ({cache.nbytes / 1e9:.2f} GB)")
+    mmap.flush()
+    torch.save(index_map, map_path)
+    torch.save(list(shape), shape_path)
+    print(f"  Cache written.")
     model.train()
-    return cache
+    return index_map, mmap
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -265,11 +296,14 @@ def main():
     )
 
     # ── Feature cache (build once, skip SigLIP every step) ──
-    feature_cache = None
+    # index_map: CPU int32 tensor  [max_abs_idx+1] → slot
+    # feat_mmap: numpy memmap on disk, demand-paged by OS
+    feat_index_map = None
+    feat_mmap      = None
     if args.cache_features:
-        feature_cache = precompute_features(model, loader, cameras, device, args.cache_features)
-        feature_cache = feature_cache.to(device)
-        print(f"  Cache on GPU: {feature_cache.shape}  ({feature_cache.nbytes / 1e9:.2f} GB)")
+        feat_index_map, feat_mmap = precompute_features(
+            model, loader, cameras, device, args.cache_features
+        )
 
     # ── Resume ──
     start_epoch = 1
@@ -304,8 +338,9 @@ def main():
                 if action_mean is not None:
                     actions = (actions - action_mean) / action_std
 
-                if feature_cache is not None:
-                    cached = feature_cache[batch["index"]].float()
+                if feat_mmap is not None:
+                    slots  = feat_index_map[batch["index"]].numpy()
+                    cached = torch.from_numpy(feat_mmap[slots].copy()).to(device, dtype=torch.float32)
                     kwargs = dict(cached_tokens=cached)
                     frames_t = frames_tH = []
                 else:
